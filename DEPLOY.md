@@ -33,7 +33,16 @@ git push -u origin main
 3. **Ports**: set the exposed port to **8501**.
 4. **Environment variables** → add:
    - `MISTRAL_API_KEY` = your key
+   - `APP_USERNAME` = the login username you want
+   - `APP_PASSWORD_HASH` = output of `python make_password.py` (**required** —
+     the app refuses to serve any data without it)
    - (optional) `OCR_MODEL`, `STRUCTURE_MODEL` — defaults are fine.
+
+   > **Never put a `$` in an environment variable value here.** Coolify feeds
+   > these through Docker Compose, which expands `$name` as a variable and
+   > silently deletes it. That is why `APP_PASSWORD_HASH` is `:`-separated.
+   > A truncated hash matches no password, and every login fails with the
+   > misleading message "Invalid credentials".
 5. **Deploy**. Coolify builds the image and starts it.
 6. Under **Domains**, Coolify gives you a free `*.sslip.io` HTTPS URL (or set
    your own domain). **That URL is your link.**

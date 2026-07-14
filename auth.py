@@ -42,21 +42,44 @@ _locked_until: float = 0.0
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
-    """Return 'pbkdf2_sha256$<iters>$<salt_hex>$<hash_hex>'."""
+    """Return 'pbkdf2_sha256:<iters>:<salt_hex>:<hash_hex>'.
+
+    The separator is ':' and never '$'. A '$' would be eaten by Docker Compose
+    variable interpolation on the way into the container, silently corrupting
+    the hash so that every login fails.
+    """
     salt = salt or os.urandom(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
-    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+    return f"pbkdf2_sha256:{PBKDF2_ITERATIONS}:{salt.hex()}:{dk.hex()}"
 
 
 def _verify_password(password: str, stored: str) -> bool:
+    # '$' is still accepted so hashes minted by older builds keep working.
+    sep = ":" if ":" in stored else "$"
     try:
-        algo, iters, salt_hex, hash_hex = stored.split("$")
+        algo, iters, salt_hex, hash_hex = stored.strip().split(sep)
         if algo != "pbkdf2_sha256":
             return False
         dk = hashlib.pbkdf2_hmac(
             "sha256", password.encode(), bytes.fromhex(salt_hex), int(iters))
         return hmac.compare_digest(dk.hex(), hash_hex)
     except Exception:
+        return False
+
+
+def _hash_is_wellformed(stored: str) -> bool:
+    """True if `stored` has the shape of a hash we could verify against."""
+    sep = ":" if ":" in stored else "$"
+    parts = stored.strip().split(sep)
+    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
+        return False
+    _, iters, salt_hex, hash_hex = parts
+    try:
+        return (int(iters) > 0
+                and bool(salt_hex) and bool(hash_hex)
+                and bytes.fromhex(salt_hex) is not None
+                and bytes.fromhex(hash_hex) is not None)
+    except ValueError:
         return False
 
 
@@ -101,6 +124,15 @@ def require_auth() -> None:
     if not user_env or not hash_env:
         st.error("🔒 Authentication is not configured. Set APP_USERNAME and "
                  "APP_PASSWORD_HASH on the server. Access is denied until then.")
+        st.stop()
+
+    # A hash that cannot possibly verify is an operator error, not a bad guess.
+    # Say so, instead of rejecting every correct password as "invalid".
+    if not _hash_is_wellformed(hash_env):
+        st.error("🔒 APP_PASSWORD_HASH is malformed, so no password can ever "
+                 "match it. If the value contains '$', Docker Compose ate part "
+                 "of it -- regenerate with `python make_password.py` and paste "
+                 "the ':'-separated hash. Access is denied until then.")
         st.stop()
 
     if is_authenticated():
