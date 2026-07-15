@@ -7,8 +7,10 @@ from dotenv import load_dotenv
 
 from auth import require_auth
 from dbx import db_ready
-from fraud_rules import (RULES, clear_flags, flag_summary, get_photo,
-                         open_flags, record_review, run_rules)
+from fraud_rules import (RULES, clear_flags, flag_summary, open_flags,
+                         record_review, run_rules)
+from ui_helpers import (flag_card, flag_title, infinite_limit,
+                        infinite_scroll_sentinel)
 
 load_dotenv()
 
@@ -59,44 +61,26 @@ else:
 st.divider()
 st.subheader("Review queue")
 rule_filter = st.selectbox("Filter by rule", ["(all)"] + list(RULES))
-rows = open_flags(None if rule_filter == "(all)" else rule_filter, limit=100)
+
+# Infinite scroll: fetch one page more than currently shown; the sentinel at
+# the bottom bumps the limit when the user scrolls to it.
+scroll_key = f"queue_pages::{rule_filter}"
+limit = infinite_limit(scroll_key)
+rows = open_flags(None if rule_filter == "(all)" else rule_filter,
+                  limit=limit + 1)
+has_more = len(rows) > limit
+rows = rows[:limit]
 
 if not rows:
     st.success("Nothing left to review in this filter. ✅")
     st.stop()
 
-st.caption(f"{len(rows)} flag(s) awaiting review — most severe first.")
+st.caption(f"Showing {len(rows)} open flag(s) — most severe first"
+           + (", scroll down for more." if has_more else "."))
 
 for f in rows:
-    sev_icon = {"high": "🔴", "medium": "🟠"}.get(f["severity"], "🟡")
-    with st.expander(
-        f"{sev_icon} **{f['rule']}** — {f['name_a']} "
-        f"({f['epic_a'] or 'no EPIC'})"
-        + (f"  ↔  {f['name_b']} ({f['epic_b'] or 'no EPIC'})"
-           if f["name_b"] else "")
-    ):
-        cols = st.columns([2, 1, 2, 1]) if f["name_b"] else st.columns([2, 1])
-
-        cols[0].markdown(
-            f"**{f['name_a']}**  \nEPIC: `{f['epic_a']}`  \n"
-            f"Part {f['part_a']} · House {f['house_a']}  \n"
-            f"Age {f['age_a']} · {f['gender_a']}"
-        )
-        pa = get_photo(f["voter_id"])
-        if pa:
-            cols[1].image(pa, width=110)
-
-        if f["name_b"]:
-            cols[2].markdown(
-                f"**{f['name_b']}**  \nEPIC: `{f['epic_b']}`  \n"
-                f"Part {f['part_b']} · House {f['house_b']}  \n"
-                f"Age {f['age_b']} · {f['gender_b']}"
-            )
-            pb = get_photo(f["related_voter_id"])
-            if pb:
-                cols[3].image(pb, width=110)
-
-        st.json(f["details"], expanded=False)
+    with st.expander(flag_title(f)):
+        flag_card(f)
 
         notes = st.text_input("Notes", key=f"n{f['id']}")
         b1, b2, b3 = st.columns(3)
@@ -109,3 +93,5 @@ for f in rows:
         if b3.button("❓ Needs info", key=f"i{f['id']}", use_container_width=True):
             record_review(f["id"], "needs_info", reviewer, notes)
             st.rerun()
+
+infinite_scroll_sentinel(scroll_key, has_more)

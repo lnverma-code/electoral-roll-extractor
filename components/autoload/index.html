@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<!-- Minimal hand-rolled Streamlit component: an invisible sentinel that sits
+     at the bottom of a list. While it is inside the browser viewport (and the
+     Python side says has_more=true) it keeps bumping a counter, which triggers
+     a rerun that loads the next page — i.e. infinite scroll.
+
+     Visibility is checked by measuring this iframe's own position in the
+     parent document (same origin), which works even where
+     IntersectionObserver callbacks are throttled or unavailable. -->
+<html>
+<body style="margin:0">
+<div id="sentinel" style="height:6px"></div>
+<script>
+  function send(type, data) {
+    window.parent.postMessage(
+      Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+  }
+
+  var hasMore = true;
+  var lastFire = 0;
+
+  function isVisible() {
+    try {
+      var r = window.frameElement.getBoundingClientRect();
+      // Compare against the scrollable ancestor's box (Streamlit scrolls
+      // section.stMain, not the window). Rect-vs-rect is robust where
+      // innerHeight is unreliable (embedded/scaled webviews).
+      var doc = window.parent.document;
+      var sc = doc.querySelector("section.stMain") || doc.documentElement;
+      var box = sc.getBoundingClientRect();
+      var top = box.top, bottom = Math.min(
+        box.bottom, doc.documentElement.clientHeight || box.bottom);
+      // 300px prefetch margin: start loading just before the user gets there
+      return r.top < bottom + 300 && r.bottom > top - 300;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function fire() {
+    var now = Date.now();
+    if (!hasMore || now - lastFire < 700 || !isVisible()) return;
+    lastFire = now;
+    // A timestamp (not a counter): stays unique even if this iframe is
+    // remounted on rerun, so the Python side can detect every new fire.
+    send("streamlit:setComponentValue", { value: now, dataType: "json" });
+  }
+
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (d && d.type === "streamlit:render") {
+      hasMore = !(d.args && d.args.has_more === false);
+    }
+  });
+
+  setInterval(fire, 700);
+
+  send("streamlit:componentReady", { apiVersion: 1 });
+  send("streamlit:setFrameHeight", { height: 8 });
+</script>
+</body>
+</html>

@@ -117,6 +117,21 @@ CREATE TABLE IF NOT EXISTS reviews (
     reviewed_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS reviews_flag_idx ON reviews (flag_id);
+
+-- The plain UNIQUE above treats NULL related_voter_id as distinct, so
+-- re-running single-voter rules used to duplicate flags. De-duplicate any
+-- legacy rows, then enforce uniqueness with NULL coalesced.
+DELETE FROM flags a USING flags b
+ WHERE a.id > b.id AND a.rule = b.rule AND a.voter_id = b.voter_id
+   AND coalesce(a.related_voter_id, -1) = coalesce(b.related_voter_id, -1);
+CREATE UNIQUE INDEX IF NOT EXISTS flags_dedup_idx
+    ON flags (rule, voter_id, coalesce(related_voter_id, -1));
+
+-- house_overload moved from one-flag-per-voter to one-flag-per-house: drop
+-- old-format flags (no 'house_norm' key in details) nobody has reviewed yet.
+DELETE FROM flags f
+ WHERE f.rule = 'house_overload' AND NOT (f.details ? 'house_norm')
+   AND NOT EXISTS (SELECT 1 FROM reviews r WHERE r.flag_id = f.id);
 """
 
 

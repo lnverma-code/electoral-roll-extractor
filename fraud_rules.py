@@ -98,15 +98,20 @@ RULES: dict[str, tuple[str, str, str]] = {
     """),
 
     # ---- implausible household size (roll stuffing into one address).
-    "house_overload": ("medium", "Unusually many electors registered to one house", """
+    # ONE flag per house (voter_id = lowest id there as representative); the
+    # review UI expands it into all occupants + a reconstructed family tree.
+    "house_overload": ("medium", "Unusually many electors in one house (grouped per house, with family-tree analysis)", """
         INSERT INTO flags (rule, severity, score, voter_id, details)
-        SELECT 'house_overload', 'medium', 0.5, v.id,
-               jsonb_build_object('house', v.house_number, 'occupants', h.n)
-        FROM voters v
-        JOIN (SELECT constituency_no, house_norm, count(*) n
+        SELECT 'house_overload', 'medium',
+               least(0.9, 0.5 + h.n / 100.0), h.rep_id,
+               jsonb_build_object('house', h.house, 'house_norm', h.house_norm,
+                                  'constituency_no', h.constituency_no,
+                                  'occupants', h.n)
+        FROM (SELECT constituency_no, house_norm,
+                     min(id) AS rep_id, count(*) AS n,
+                     min(house_number) AS house
               FROM voters WHERE house_norm <> ''
-              GROUP BY 1,2 HAVING count(*) > 15) h
-          ON h.constituency_no = v.constituency_no AND h.house_norm = v.house_norm
+              GROUP BY 1, 2 HAVING count(*) > 15) h
         ON CONFLICT DO NOTHING;
     """),
 
@@ -173,8 +178,10 @@ def open_flags(rule: str | None = None, limit: int = 200):
         SELECT f.id, f.rule, f.severity, f.score, f.details,
                va.name AS name_a, va.epic_no AS epic_a, va.part_no AS part_a,
                va.house_number AS house_a, va.age AS age_a, va.gender AS gender_a,
+               va.constituency_no AS const_a, va.serial_no AS serial_a,
                vb.name AS name_b, vb.epic_no AS epic_b, vb.part_no AS part_b,
                vb.house_number AS house_b, vb.age AS age_b, vb.gender AS gender_b,
+               vb.constituency_no AS const_b, vb.serial_no AS serial_b,
                f.voter_id, f.related_voter_id
         FROM flags f
         JOIN voters va ON va.id = f.voter_id
@@ -192,6 +199,84 @@ def open_flags(rule: str | None = None, limit: int = 200):
     params.append(limit)
     with connect() as c:
         return c.execute(q, params).fetchall()
+
+
+def house_members(constituency_no: str | None, house_norm: str):
+    """Every elector registered at one (constituency, normalised house)."""
+    with connect() as c:
+        return c.execute(
+            """SELECT id, name, name_norm, relation_type, relation_name,
+                      relation_name_norm, age, gender, serial_no, part_no,
+                      house_number, epic_no, constituency_no
+               FROM voters
+               WHERE coalesce(constituency_no,'') = coalesce(%s,'')
+                 AND house_norm = %s
+               ORDER BY part_no, serial_no NULLS LAST, id""",
+            (constituency_no, house_norm),
+        ).fetchall()
+
+
+# Latest verdict wins when a flag was re-adjudicated.
+_LATEST_REVIEW = """
+    JOIN LATERAL (SELECT verdict, reviewer, notes, reviewed_at
+                  FROM reviews WHERE flag_id = f.id
+                  ORDER BY reviewed_at DESC, id DESC LIMIT 1) r ON TRUE
+"""
+
+
+def reviewed_flags(verdict: str | None = None, rule: str | None = None,
+                   limit: int = 200):
+    """Flags that already have a verdict, grouped confirmed -> legitimate ->
+    needs_info (newest review first inside each group), so they can be
+    revisited later."""
+    q = f"""
+        SELECT f.id, f.rule, f.severity, f.score, f.details,
+               f.voter_id, f.related_voter_id,
+               r.verdict, r.reviewer, r.notes, r.reviewed_at,
+               va.name AS name_a, va.epic_no AS epic_a, va.part_no AS part_a,
+               va.house_number AS house_a, va.age AS age_a, va.gender AS gender_a,
+               va.constituency_no AS const_a, va.serial_no AS serial_a,
+               vb.name AS name_b, vb.epic_no AS epic_b, vb.part_no AS part_b,
+               vb.house_number AS house_b, vb.age AS age_b, vb.gender AS gender_b,
+               vb.constituency_no AS const_b, vb.serial_no AS serial_b
+        FROM flags f
+        {_LATEST_REVIEW}
+        JOIN voters va ON va.id = f.voter_id
+        LEFT JOIN voters vb ON vb.id = f.related_voter_id
+        WHERE TRUE
+    """
+    params: list = []
+    if verdict:
+        q += " AND r.verdict = %s"
+        params.append(verdict)
+    if rule:
+        q += " AND f.rule = %s"
+        params.append(rule)
+    q += """ ORDER BY CASE r.verdict WHEN 'confirmed' THEN 1
+                       WHEN 'legitimate' THEN 2 ELSE 3 END,
+             r.reviewed_at DESC, f.id
+             LIMIT %s"""
+    params.append(limit)
+    with connect() as c:
+        return c.execute(q, params).fetchall()
+
+
+def reviewed_summary():
+    """{verdict: count} using each flag's latest verdict."""
+    with connect() as c:
+        rows = c.execute(f"""
+            SELECT r.verdict, count(*) AS n
+            FROM flags f {_LATEST_REVIEW}
+            GROUP BY 1
+        """).fetchall()
+    return {row["verdict"]: row["n"] for row in rows}
+
+
+def reopen_flag(flag_id: int) -> None:
+    """Wipe a flag's reviews so it returns to the open queue."""
+    with connect() as c:
+        c.execute("DELETE FROM reviews WHERE flag_id = %s", (flag_id,))
+        c.commit()
 
 
 def record_review(flag_id: int, verdict: str, reviewer: str, notes: str = ""):
