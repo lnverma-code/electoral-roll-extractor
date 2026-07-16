@@ -516,3 +516,17 @@ def get_photo(voter_id: int) -> bytes | None:
         r = c.execute("SELECT image FROM photos WHERE voter_id=%s",
                       (voter_id,)).fetchone()
     return bytes(r["image"]) if r and r["image"] else None
+
+
+def get_photos(voter_ids) -> dict[int, bytes]:
+    """Batch photo lookup — one query for many voters (the PDF export needs
+    thousands; one-by-one round trips would be far too slow)."""
+    ids = [v for v in {*voter_ids} if v]
+    if not ids:
+        return {}
+    with connect() as c:
+        rows = c.execute(
+            "SELECT voter_id, image FROM photos WHERE voter_id = ANY(%s)",
+            (ids,),
+        ).fetchall()
+    return {r["voter_id"]: bytes(r["image"]) for r in rows if r["image"]}

@@ -10,7 +10,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from family import analyse_household, cluster_dot
-from fraud_rules import (all_flags_for_export, get_photo,
+from fraud_rules import (all_flags_for_export, get_photo, get_photos,
                          house_overload_members_for_export, house_members)
 
 # ---------------------------------------------------------------- infinite scroll
@@ -170,6 +170,129 @@ def build_flags_export(rule_filter: str | None) -> bytes:
         flags_df.to_excel(xl, index=False, sheet_name="Flags")
         house_df.to_excel(xl, index=False, sheet_name="House Overload Members")
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------- PDF export
+_PDF_PER_PAGE = 5           # comparison blocks per A4 page
+_A4 = (595.28, 841.89)      # points
+
+
+def _pdf_voter_lines(f, side: str) -> list[str]:
+    """The same fields the review card shows, one voter, as text lines."""
+    g = lambda k: f.get(f"{k}_{side}")
+    serial = g("serial")
+    rel = f"{g('relation_type') or ''} {g('relation_name') or ''}".strip()
+    return [
+        (g("name") or "—"),
+        f"EPIC: {g('epic') or 'no EPIC'}",
+        f"AC {g('const') or '?'} · Part {g('part') or '?'} · "
+        f"Serial {serial if serial is not None else '?'}",
+        f"House {g('house') or '?'} · Age "
+        f"{g('age') if g('age') is not None else '?'} · {g('gender') or '?'}",
+        f"Relation: {rel or '—'}",
+    ]
+
+
+def _pdf_draw_voter(page, x: float, y: float, w: float, h: float,
+                    lines: list[str], photo: bytes | None) -> None:
+    """One voter panel: photo on the left, detail lines to its right."""
+    import fitz
+    pw, ph = 46, 56
+    prect = fitz.Rect(x + 3, y + 3, x + 3 + pw, y + 3 + ph)
+    if photo:
+        try:
+            page.insert_image(prect, stream=photo, keep_proportion=True)
+        except Exception:
+            page.draw_rect(prect, color=(.7, .7, .7), width=.5)
+    else:
+        page.draw_rect(prect, color=(.8, .8, .8), width=.5)
+        page.insert_textbox(prect, "no\nphoto", fontsize=6,
+                            color=(.5, .5, .5), align=fitz.TEXT_ALIGN_CENTER)
+    trect = fitz.Rect(x + 3 + pw + 5, y + 1, x + w - 3, y + h - 1)
+    # first line (name) bold, rest regular — draw name then the block below it
+    page.insert_textbox(trect, lines[0] + "\n", fontsize=8, fontname="hebo")
+    body = fitz.Rect(trect.x0, trect.y0 + 11, trect.x1, trect.y1)
+    page.insert_textbox(body, "\n".join(lines[1:]), fontsize=7, fontname="helv")
+
+
+def build_flags_pdf(rule_filter: str | None) -> bytes:
+    """PDF of every flag matching the filter: each flag is one side-by-side
+    comparison (voter A vs voter B) with both photos and all details;
+    _PDF_PER_PAGE comparisons per A4 page."""
+    import fitz
+    rows = all_flags_for_export(rule_filter)
+    ids = set()
+    for f in rows:
+        ids.add(f["voter_id"])
+        if f["related_voter_id"]:
+            ids.add(f["related_voter_id"])
+    photos = get_photos(ids)
+
+    doc = fitz.open()
+    pw, phg = _A4
+    M, top = 28, 52
+    usable_h = phg - top - M
+    row_h = usable_h / _PDF_PER_PAGE
+    col_w = (pw - 2 * M) / 2
+    sev_icon = {"high": "[HIGH]", "medium": "[MED]", "low": "[LOW]"}
+
+    page = None
+    for i, f in enumerate(rows):
+        slot = i % _PDF_PER_PAGE
+        if slot == 0:
+            page = doc.new_page(width=pw, height=phg)
+            page.insert_textbox(
+                fitz.Rect(M, 20, pw - M, 44),
+                f"Fraud flags - {rule_filter or 'all rules'}   "
+                f"(page {len(doc)},  {len(rows)} flag(s) total)",
+                fontsize=11, fontname="hebo")
+            page.draw_line(fitz.Point(M, 46), fitz.Point(pw - M, 46),
+                           color=(.6, .6, .6), width=.7)
+
+        y0 = top + slot * row_h
+        page.draw_rect(fitz.Rect(M, y0, pw - M, y0 + row_h - 4),
+                       color=(.85, .85, .85), width=.5)
+        d = f.get("details") or {}
+        extra = ""
+        if d.get("name_sim") is not None:
+            extra = f"   name_sim={d['name_sim']}"
+        elif d.get("cosine") is not None:
+            extra = f"   cosine={d['cosine']}"
+        score = f["score"]
+        verdict = f" · {f['verdict']}" if f.get("verdict") else ""
+        page.insert_text(
+            fitz.Point(M + 4, y0 + 10),
+            f"{sev_icon.get(f['severity'], '')} {f['rule']}"
+            f"   score={round(score, 3) if score is not None else '?'}{extra}{verdict}",
+            fontsize=8, fontname="hebo", color=(.15, .15, .15))
+
+        body_y = y0 + 14
+        body_h = row_h - 4 - 14
+        _pdf_draw_voter(page, M, body_y, col_w, body_h,
+                        _pdf_voter_lines(f, "a"), photos.get(f["voter_id"]))
+        # vertical divider
+        page.draw_line(fitz.Point(M + col_w, body_y + 1),
+                       fitz.Point(M + col_w, y0 + row_h - 6),
+                       color=(.8, .8, .8), width=.5)
+        if f["name_b"]:
+            _pdf_draw_voter(page, M + col_w, body_y, col_w, body_h,
+                            _pdf_voter_lines(f, "b"),
+                            photos.get(f["related_voter_id"]))
+        else:
+            note = "House-overload group"
+            if d.get("occupants"):
+                note += f" - {d['occupants']} electors at House {d.get('house') or '?'}"
+            page.insert_textbox(
+                fitz.Rect(M + col_w + 6, body_y + 4, pw - M - 3, y0 + row_h - 6),
+                note, fontsize=8, fontname="helv", color=(.4, .4, .4))
+
+    if page is None:                                   # no flags at all
+        page = doc.new_page(width=pw, height=phg)
+        page.insert_textbox(fitz.Rect(M, 40, pw - M, 80),
+                            "No flags to export.", fontsize=12)
+    out = doc.tobytes()
+    doc.close()
+    return out
 
 
 def _members_df(members: list, hh) -> "pd.DataFrame":

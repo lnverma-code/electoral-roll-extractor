@@ -9,8 +9,8 @@ from auth import require_auth
 from dbx import db_ready
 from fraud_rules import (RULES, clear_flags, flag_summary, open_flags,
                          record_review, run_rules)
-from ui_helpers import (build_flags_export, flag_card, flag_title,
-                        infinite_limit, infinite_scroll_sentinel)
+from ui_helpers import (build_flags_export, build_flags_pdf, flag_card,
+                        flag_title, infinite_limit, infinite_scroll_sentinel)
 
 load_dotenv()
 
@@ -62,15 +62,37 @@ st.divider()
 st.subheader("Review queue")
 rule_filter = st.selectbox("Filter by rule", ["(all)"] + list(RULES))
 
-st.download_button(
-    "⬇️ Download all flags (Excel)",
-    data=build_flags_export(None if rule_filter == "(all)" else rule_filter),
-    file_name="fraud_flags.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    help="Both voters' full details side-by-side for every flag (open + "
-         "reviewed) matching the current rule filter, plus a sheet listing "
-         "every occupant of each flagged house.",
-)
+_filter = None if rule_filter == "(all)" else rule_filter
+dl1, dl2 = st.columns(2)
+with dl1:
+    st.download_button(
+        "⬇️ Download all flags (Excel)",
+        data=build_flags_export(_filter),
+        file_name="fraud_flags.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Both voters' full details side-by-side for every flag (open + "
+             "reviewed) matching the current rule filter, plus a sheet listing "
+             "every occupant of each flagged house.",
+        use_container_width=True,
+    )
+with dl2:
+    # PDF embeds photos for every flag, so it is heavy — build only on click,
+    # not on every rerun, and cache the bytes for the current filter.
+    pdf_key = f"flags_pdf::{rule_filter}"
+    if st.button("🧾 Prepare PDF (photos, 5 / page)", use_container_width=True,
+                 help="Side-by-side comparison with both photos and all "
+                      "details for every flag matching the current filter — "
+                      "5 comparisons per A4 page."):
+        with st.spinner("Building PDF (embedding photos)…"):
+            st.session_state[pdf_key] = build_flags_pdf(_filter)
+    if st.session_state.get(pdf_key):
+        st.download_button(
+            "⬇️ Download flags PDF",
+            data=st.session_state[pdf_key],
+            file_name="fraud_flags.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
 # Infinite scroll: fetch one page more than currently shown; the sentinel at
 # the bottom bumps the limit when the user scrolls to it.
