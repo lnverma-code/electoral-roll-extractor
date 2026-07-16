@@ -105,13 +105,14 @@ def _run_cosine(c) -> None:
                       "epic_a": r["ae"], "epic_b": r["be"]}),
             ))
     if batch:
-        c.executemany(
-            """INSERT INTO flags (rule, severity, score, voter_id,
-                                  related_voter_id, details)
-               VALUES ('cosine_dup', 'medium', %s, %s, %s, %s)
-               ON CONFLICT DO NOTHING""",
-            batch,
-        )
+        with c.cursor() as cur:          # executemany is a cursor method, not a
+            cur.executemany(             # connection method, in psycopg 3
+                """INSERT INTO flags (rule, severity, score, voter_id,
+                                      related_voter_id, details)
+                   VALUES ('cosine_dup', 'medium', %s, %s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                batch,
+            )
 
 
 # Each rule: id -> (severity, human description, SQL string OR callable(cursor)).
