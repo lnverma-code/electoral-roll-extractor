@@ -118,4 +118,52 @@ assert a["798"]["EPIC_No"] == "CRC0299412" and a["798"]["Name"] == "Anyen Arangh
 assert a["800"]["EPIC_No"] == "GYS0303487" and a["800"]["Name"] == "JITEN RAI"
 assert aissues["incomplete_rows"] == [], aissues
 
+# ---- page_quality: the OCR self-check. No single render zoom is safe --
+# ---- one roll dropped EPICs at 1x, another hallucinated at 2x -- so every
+# ---- page is graded and only bad ones are re-OCR'd.
+from extractor import page_quality  # noqa: E402
+
+_GOOD = """Assembly Constituency No and Name : 58-KANUBARI
+Part No. : 18
+
+|  1 Name : A ONE Fathers Name : X House Number : E-1 Age : 30 Gender : Male | CRC0000001 | 2 Name : B TWO Fathers Name : Y House Number : E-2 Age : 31 Gender : Female | CRC0000002  |
+"""
+ok, score = page_quality(PageText(index=2, markdown=_GOOD))
+assert ok and score == 2, f"good page rejected: {ok} {score}"
+
+# EPIC column dropped by OCR (the ENG-2 page-14 bug): must be REJECTED.
+_NO_EPIC = """Part No. : 18
+
+|  1 Name : A ONE Fathers Name : X House Number : E-1 Age : 30 Gender : Male | 2 Name : B TWO Fathers Name : Y House Number : E-2 Age : 31 Gender : Female | CRC0000002  |
+"""
+ok, _ = page_quality(PageText(index=2, markdown=_NO_EPIC))
+assert not ok, "page with a dropped EPIC column was accepted"
+
+# Hallucination loop (the ENG-18 page-3 bug at 2x): repeated records, no
+# EPICs. Must be REJECTED -- and must NOT be mistaken for a cover page.
+_HALLUCINATED = """Assembly Constituency No and Name : 58-KANUBARI
+Part No. : 18
+
+|  1 Name : C WANGSU Fathers Name : N WANGSU House Number : E-3 Age : 19 Gender : Male | 2 Name : C WANGSU Fathers Name : N WANGSU House Number : E-3 Age : 19 Gender : Male | 3 Name : C WANGSU Fathers Name : N WANGSU House Number : E-3 Age : 19 Gender : Male  |
+"""
+ok, score = page_quality(PageText(index=2, markdown=_HALLUCINATED))
+assert not ok and score < 0, f"hallucinated page accepted: {ok} {score}"
+
+# A cover page has no voter content and must pass (nothing to extract).
+ok, _ = page_quality(PageText(index=0, markdown=
+    "Assembly Constituency No and Name : 58-KANUBARI\nPart No. : 18\n"))
+assert ok, "cover page wrongly flagged for re-OCR"
+
+# A genuinely blank House Number is real roll data, NOT an OCR fault. It must
+# not send the page into a re-OCR loop it can never win.
+_BLANK_HOUSE = """Part No. : 18
+
+|  111 Name : THOMWANG APESAM Fathers Name : NOKKHU APESAM House Number : Age : 39 Gender : Male | CRC0121426  |
+"""
+ok, _ = page_quality(PageText(index=5, markdown=_BLANK_HOUSE))
+assert ok, "blank House Number wrongly treated as an OCR failure"
+brows, _ = build_rows([PageText(index=5, markdown=_BLANK_HOUSE)], method="regex")
+assert len(brows) == 1 and brows[0]["EPIC_No"] == "CRC0121426"
+assert brows[0]["House_Number"] == "", "invented a house number that is blank in source"
+
 print("\nALL ASSERTIONS PASSED")

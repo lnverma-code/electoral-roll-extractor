@@ -60,6 +60,50 @@ def ocr_batched(provider, pdf_bytes: bytes, include_images: bool,
     return pages
 
 
+# Zooms to retry a page at when the first OCR pass fails validation. OCR
+# quality is resolution-dependent and NOT monotonic -- some pages only come out
+# right at 2x, others only at 1x -- so the ladder is tried until a page passes.
+ALT_ZOOMS = (2.0, 3.0, 1.5)
+
+
+def repair_bad_pages(provider, pdf_bytes: bytes, pages: list[PageText],
+                     include_images: bool, progress: Progress) -> list[PageText]:
+    """Validate every OCR'd page; re-OCR the bad ones at other zooms and keep
+    the best result. This is what stops a silently-mangled page (missing EPICs,
+    or a hallucinated repeat loop) from reaching the output."""
+    from extractor import page_quality
+
+    out: list[PageText] = []
+    for p in pages:
+        ok, score = page_quality(p)
+        if ok:
+            out.append(p)
+            continue
+
+        best_page, best_score = p, score
+        for z in ALT_ZOOMS:
+            progress(f"Page {p.index + 1} looks wrong — retrying OCR at {z}x…")
+            try:
+                sub = sub_pdf(pdf_bytes, [p.index])
+                if not sub:
+                    break
+                res = provider.ocr_pdf(sub, include_images=include_images, zoom=z)
+                if not res:
+                    continue
+                cand = PageText(index=p.index, markdown=res[0].markdown,
+                                images=res[0].images)
+                cok, cscore = page_quality(cand)
+                if cscore > best_score:
+                    best_page, best_score = cand, cscore
+                if cok:
+                    progress(f"Page {p.index + 1} recovered at {z}x.")
+                    break
+            except Exception:
+                continue
+        out.append(best_page)
+    return out
+
+
 def make_zip(base: str, pdf_bytes: bytes, df: pd.DataFrame,
              photos_dir: Path | None) -> bytes:
     """Bundle the original PDF, the Excel, and any photos into one ZIP."""
@@ -87,6 +131,9 @@ def process_pdf(pdf_bytes: bytes, filename: str, method: str,
     base = Path(filename).stem or "electoral_roll"
 
     pages = ocr_batched(provider, pdf_bytes, include_photos, progress)
+
+    progress("Validating OCR quality per page…", 0.65)
+    pages = repair_bad_pages(provider, pdf_bytes, pages, include_photos, progress)
 
     progress("Extracting & verifying voter records…", 0.7)
     with tempfile.TemporaryDirectory() as td:

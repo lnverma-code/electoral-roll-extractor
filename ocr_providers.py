@@ -33,8 +33,14 @@ class OCRProvider(ABC):
     name: str = "base"
 
     @abstractmethod
-    def ocr_pdf(self, pdf_bytes: bytes, include_images: bool = False) -> list[PageText]:
-        """Run OCR over the whole PDF and return one PageText per page."""
+    def ocr_pdf(self, pdf_bytes: bytes, include_images: bool = False,
+                zoom: float | None = None) -> list[PageText]:
+        """Run OCR over the whole PDF and return one PageText per page.
+
+        `zoom` optionally re-renders the pages at that scale first. OCR quality
+        is resolution-dependent in BOTH directions, so callers may retry a bad
+        page at a different zoom (see pipeline.repair_bad_pages).
+        """
         raise NotImplementedError
 
 
@@ -74,21 +80,26 @@ class MistralOCRProvider(OCRProvider):
     def __init__(self, api_key: str | None = None, model: str | None = None):
         self.api_key = api_key or os.getenv("MISTRAL_API_KEY")
         self.model = model or os.getenv("OCR_MODEL", "mistral-ocr-latest")
-        self.render_zoom = float(os.getenv("OCR_RENDER_ZOOM", "2.0"))
+        # Native by default; pipeline escalates per page only when needed.
+        self.render_zoom = float(os.getenv("OCR_RENDER_ZOOM", "1.0"))
         if not self.api_key:
             raise RuntimeError(
                 "MISTRAL_API_KEY is not set. Add it to your .env file."
             )
 
-    def ocr_pdf(self, pdf_bytes: bytes, include_images: bool = False) -> list[PageText]:
+    def ocr_pdf(self, pdf_bytes: bytes, include_images: bool = False,
+                zoom: float | None = None) -> list[PageText]:
         # Imported lazily so the app can start even before the SDK is installed.
         from mistralai import Mistral
 
-        # Scanned rolls come in at a resolution where Mistral's table parser
-        # silently drops the EPIC column (emits 4 cells per row instead of 6).
-        # Re-rendering each page at 2x makes it emit the full table. Verified:
-        # a page that returned 10/30 EPICs returns 30/30 after re-rendering.
-        pdf_bytes = _rerender(pdf_bytes, self.render_zoom)
+        # Resolution changes what Mistral emits, and NOT monotonically:
+        #   * one roll dropped 20/30 EPICs at 1x but was perfect at 2x
+        #   * another degenerated into a 100-row hallucination loop with 0 EPICs
+        #     at 2x, but was perfect at 1x
+        # So no single zoom is safe. We default to native and let the caller
+        # retry a page at another zoom when validation fails.
+        z = self.render_zoom if zoom is None else zoom
+        pdf_bytes = _rerender(pdf_bytes, z)
 
         client = Mistral(api_key=self.api_key)
         data_uri = "data:application/pdf;base64," + base64.b64encode(pdf_bytes).decode()

@@ -34,6 +34,13 @@ REQUIRED_FIELDS = [
     "Relation_Name", "House_Number", "Age", "Gender",
 ]
 
+# Fields that a genuine roll ALWAYS prints, so if one is missing the OCR is at
+# fault, not the source. Used to grade OCR quality (page_quality).
+# House_Number is deliberately excluded: rolls really do ship records with an
+# empty "House Number :" (verified against the scan), and treating that as an
+# OCR failure sends the page into a pointless re-OCR loop it can never win.
+CORE_FIELDS = ["Serial_No", "EPIC_No", "Name", "Age", "Gender"]
+
 
 @dataclass
 class Voter:
@@ -252,10 +259,17 @@ _SERIAL_ANCHORED_RE = re.compile(
 
 
 def _page_has_voter_content(text: str) -> bool:
-    """Does this page clearly hold voter records? Used so a page can never be
-    silently skipped just because the strict parser understood none of it."""
-    return bool(_EPIC_RE.search(text or "")) and bool(
-        re.search(r"[Nn]ame\s*[:：]", text or ""))
+    """Does this page hold voter records? Used so a page can never be silently
+    skipped just because the parsers understood none of it.
+
+    Deliberately EITHER/OR, not AND: a page whose EPIC column the OCR dropped
+    still holds voters (that is the bug we are hunting), and a transposed page
+    can yield EPICs before any '<serial> Name :' marker. Requiring both would
+    misfile a mangled data page as a harmless cover page. Cover/summary pages
+    have neither, so they are still correctly ignored.
+    """
+    t = text or ""
+    return bool(_page_serial_markers(t)) or bool(_EPIC_RE.search(t))
 
 
 # The page header ("Assembly Constituency No and Name : 58-KANUBARI",
@@ -579,6 +593,41 @@ def _repair_page(page, client, model) -> list[Voter]:
     out = [v for v in merged.values()
            if not valid or v.Serial_No in valid]
     return sorted(out, key=_serial_key)
+
+
+def page_quality(page) -> tuple[bool, float]:
+    """Judge one OCR'd page. Returns (is_trustworthy, score).
+
+    OCR on these scans fails in two ways that a single blind pass cannot
+    detect, so every page is graded before it is believed:
+      * dropped EPIC column  -> voters parse but have no EPIC_No
+      * hallucination loop   -> the model repeats rows forever, emitting many
+                                bogus voters and zero EPICs
+    Both show up as "records that are not fully populated", which is what the
+    score measures. Higher score = more complete voters, penalised for
+    duplicate serials and repeated identical records.
+    """
+    md = page.markdown or ""
+    if not _page_has_voter_content(md):
+        return True, 0.0            # cover / map / summary page: nothing to get
+
+    voters = _repair_page(page, None, None)   # parsers only, no LLM, no network
+    if not voters:
+        return False, -1.0
+
+    # Grade on CORE fields only. A blank House Number can be real (the roll
+    # prints some that way); a blank EPIC never is.
+    complete = sum(1 for v in voters
+                   if all(getattr(v, f) for f in CORE_FIELDS))
+    serials = [v.Serial_No for v in voters]
+    dup_serials = len(serials) - len(set(serials))
+    # A hallucination loop repeats the same person over and over.
+    sigs = [(v.Name, v.Relation_Name, v.House_Number, v.Age) for v in voters]
+    dup_records = len(sigs) - len(set(sigs))
+
+    score = complete - 5.0 * dup_serials - 2.0 * dup_records
+    ok = (complete == len(voters) and dup_serials == 0 and dup_records == 0)
+    return ok, score
 
 
 def _single_page_pdf(pdf_bytes: bytes, idx: int) -> bytes:
