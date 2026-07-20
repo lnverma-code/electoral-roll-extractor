@@ -2,7 +2,6 @@
 house_overload view with family-tree reconstruction, and infinite scroll."""
 from __future__ import annotations
 
-import io
 from pathlib import Path
 
 import pandas as pd
@@ -11,7 +10,7 @@ import streamlit.components.v1 as components
 
 from family import analyse_household, cluster_dot
 from fraud_rules import (all_flags_for_export, get_photo, get_photos,
-                         house_overload_members_for_export, house_members)
+                         house_members)
 
 # ---------------------------------------------------------------- infinite scroll
 PAGE_STEP = 100
@@ -126,50 +125,6 @@ def _house_overload_card(f, d: dict) -> None:
         df = _members_df(hh.members, hh)
         df.insert(0, "Family", [group_of.get(m["id"], "—") for m in hh.members])
         st.dataframe(df, use_container_width=True, hide_index=True)
-
-
-# ---------------------------------------------------------------- export
-_SIDE_A_COLS = {
-    "name_a": "Name (A)", "epic_a": "EPIC (A)", "relation_type_a": "Relation Type (A)",
-    "relation_name_a": "Relation Name (A)", "const_a": "AC No. (A)", "part_a": "Part (A)",
-    "serial_a": "Serial (A)", "house_a": "House (A)", "age_a": "Age (A)", "gender_a": "Gender (A)",
-}
-_SIDE_B_COLS = {
-    "name_b": "Name (B)", "epic_b": "EPIC (B)", "relation_type_b": "Relation Type (B)",
-    "relation_name_b": "Relation Name (B)", "const_b": "AC No. (B)", "part_b": "Part (B)",
-    "serial_b": "Serial (B)", "house_b": "House (B)", "age_b": "Age (B)", "gender_b": "Gender (B)",
-}
-
-
-def build_flags_export(rule_filter: str | None) -> bytes:
-    """Excel workbook: every flag with both voters' details side-by-side (the
-    same fields the review card shows), plus a sheet listing every occupant
-    of each flagged house_overload house."""
-    rows = all_flags_for_export(rule_filter)
-    front = ["id", "rule", "severity", "score", "verdict", "reviewer", "notes",
-             "reviewed_at"]
-    records = []
-    for f in rows:
-        rec = {k: f.get(k) for k in front}
-        for k, label in _SIDE_A_COLS.items():
-            rec[label] = f.get(k)
-        for k, label in _SIDE_B_COLS.items():
-            rec[label] = f.get(k)
-        rec["Details"] = f.get("details")
-        records.append(rec)
-    flags_df = pd.DataFrame(records)
-
-    house_rows = house_overload_members_for_export(rule_filter)
-    house_df = pd.DataFrame(house_rows) if house_rows else pd.DataFrame(
-        columns=["flag_id", "house", "constituency_no", "id", "name",
-                "relation_type", "relation_name", "age", "gender", "serial_no",
-                "part_no", "house_number", "epic_no", "constituency_no"])
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-        flags_df.to_excel(xl, index=False, sheet_name="Flags")
-        house_df.to_excel(xl, index=False, sheet_name="House Overload Members")
-    return buf.getvalue()
 
 
 # ---------------------------------------------------------------- PDF export
