@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from auth import require_auth
 from dbx import available_years, db_ready
 from fraud_rules import (RULES, clear_flags, flag_counts_by_constituency,
+                         flag_entry_counts_by_constituency_rule,
                          flag_counts_by_constituency_rule, flag_summary,
                          flagged_constituencies, open_flags, record_review,
                          run_rules)
@@ -95,27 +96,49 @@ with s2:
         st.caption("No constituency breakdown available.")
 
 # ---- model (rule) x constituency matrix
-st.subheader(f"Flags by model × constituency — {year}")
-mx = pd.DataFrame(flag_counts_by_constituency_rule(year))
+st.subheader(f"Model × constituency — {year}")
+MEASURES = {
+    "Flagged voter entries (both sides)":
+        ("entries", "Every name on a flag, counted in **its own** AC — a pair "
+                    "contributes one entry to each side's constituency. A "
+                    "voter appearing in several pairs is counted each time. "
+                    "Totals = 2 × paired flags + 1 × single-voter flags."),
+    "Distinct voters implicated":
+        ("voters",  "How many **different people** are involved — the same "
+                    "voter caught in many pairs counts once per AC."),
+    "Flags (pairs)":
+        ("flags",   "One row per flag, attributed to voter A's AC only. This "
+                    "is the review-queue count."),
+}
+measure_label = st.radio("Count as", list(MEASURES), horizontal=True,
+                         key="matrix_measure")
+measure, measure_help = MEASURES[measure_label]
+
+label = {r["constituency_no"]: (f"AC {r['constituency_no']} — "
+                                f"{r['constituency_name']}"
+                                if r["constituency_name"]
+                                else f"AC {r['constituency_no']}")
+         for r in flag_counts_by_constituency(year)}
+
+if measure == "flags":
+    mx = pd.DataFrame(flag_counts_by_constituency_rule(year))
+    value_col = "flags"
+else:
+    mx = pd.DataFrame(flag_entry_counts_by_constituency_rule(year))
+    value_col = measure
+
 if mx.empty:
     st.caption("No flags to break down yet.")
 else:
-    label = {r["constituency_no"]: (f"AC {r['constituency_no']} — "
-                                    f"{r['constituency_name']}"
-                                    if r["constituency_name"]
-                                    else f"AC {r['constituency_no']}")
-             for r in flag_counts_by_constituency(year)}
     piv = (mx.pivot_table(index="constituency_no", columns="rule",
-                          values="flags", aggfunc="sum", fill_value=0)
+                          values=value_col, aggfunc="sum", fill_value=0)
              .reindex(columns=list(RULES), fill_value=0))     # stable rule order
     piv.insert(0, "TOTAL", piv.sum(axis=1))
     piv.loc["ALL ACs"] = piv.sum(axis=0)                      # column totals
     piv.index = [label.get(i, i) for i in piv.index]
     piv.index.name = "Constituency"
     st.dataframe(piv, use_container_width=True)
-    st.caption("Rows are constituencies (last row = all ACs), columns are "
-               "detection models. TOTAL is that constituency's flags across "
-               "every model.")
+    st.caption(measure_help)
 
 # ---------------------------------------------------------------- queue
 st.divider()

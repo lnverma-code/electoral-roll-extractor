@@ -414,6 +414,44 @@ def flag_counts_by_constituency_rule(year: int | None = None):
         return c.execute(q, params).fetchall()
 
 
+def flag_entry_counts_by_constituency_rule(year: int | None = None):
+    """Per (constituency, rule): how many flagged voter ENTRIES belong to that
+    AC, counting BOTH sides of a pair in their own AC.
+
+    flag_counts_by_constituency counts a pair once (under voter A). This counts
+    the names instead: a pair contributes one entry to A's AC and one to B's,
+    so a cross-AC duplicate shows up in both seats. Totals therefore come to
+    2 x paired flags + 1 x single-voter flags.
+
+    `entries` counts appearances (a voter in three pairs counts three times);
+    `voters` counts how many distinct people are actually implicated."""
+    side_a = """
+        SELECT coalesce(nullif(va.constituency_no, ''), '(unknown)') AS ac,
+               max(va.constituency_name) OVER (PARTITION BY va.constituency_no)
+                   AS ac_name,
+               f.rule AS rule, f.voter_id AS vid
+        FROM flags f JOIN voters va ON va.id = f.voter_id
+        WHERE %(year)s IS NULL OR va.year = %(year)s
+    """
+    side_b = """
+        SELECT coalesce(nullif(vb.constituency_no, ''), '(unknown)') AS ac,
+               max(vb.constituency_name) OVER (PARTITION BY vb.constituency_no)
+                   AS ac_name,
+               f.rule AS rule, f.related_voter_id AS vid
+        FROM flags f JOIN voters vb ON vb.id = f.related_voter_id
+        WHERE %(year)s IS NULL OR vb.year = %(year)s
+    """
+    q = f"""
+        SELECT ac AS constituency_no, max(ac_name) AS constituency_name,
+               rule, count(*) AS entries, count(DISTINCT vid) AS voters
+        FROM ( {side_a} UNION ALL {side_b} ) t
+        GROUP BY ac, rule ORDER BY ac, rule
+    """
+    with connect() as c:
+        return c.execute(q, {"year": None if year is None else int(year)}
+                         ).fetchall()
+
+
 def flagged_constituencies(year: int | None = None,
                            rule: str | None = None) -> list[str]:
     """Constituency numbers that actually have flags — drives the per-AC
