@@ -177,6 +177,63 @@ def epic_documents(epic_no: str) -> list[dict]:
     return rows
 
 
+def voters_by_epic(epic_no: str) -> list[dict]:
+    """Every voter row that shares this EPIC (across all revision years)."""
+    if not epic_no:
+        return []
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM voters WHERE epic_no = %s ORDER BY year DESC, id",
+            (epic_no,)).fetchall()
+
+
+def flags_for_voters(voter_ids: list[int]) -> list[dict]:
+    """Every flag touching any of these voters — on either side of a pair —
+    with both electors' summary and the latest review verdict, if any."""
+    ids = [v for v in voter_ids if v]
+    if not ids:
+        return []
+    q = """
+        SELECT f.id, f.rule, f.severity, f.score, f.details, f.created_at,
+               f.voter_id, f.related_voter_id,
+               va.name AS name_a, va.epic_no AS epic_a, va.year AS year_a,
+               va.constituency_no AS const_a, va.part_no AS part_a,
+               va.serial_no AS serial_a, va.house_number AS house_a,
+               va.age AS age_a, va.gender AS gender_a,
+               vb.name AS name_b, vb.epic_no AS epic_b, vb.year AS year_b,
+               vb.constituency_no AS const_b, vb.part_no AS part_b,
+               vb.serial_no AS serial_b, vb.house_number AS house_b,
+               vb.age AS age_b, vb.gender AS gender_b,
+               r.verdict, r.reviewer, r.reviewed_at
+        FROM flags f
+        JOIN voters va ON va.id = f.voter_id
+        LEFT JOIN voters vb ON vb.id = f.related_voter_id
+        LEFT JOIN LATERAL (
+            SELECT verdict, reviewer, reviewed_at FROM reviews
+            WHERE flag_id = f.id ORDER BY reviewed_at DESC, id DESC LIMIT 1
+        ) r ON TRUE
+        WHERE f.voter_id = ANY(%s) OR f.related_voter_id = ANY(%s)
+        ORDER BY CASE f.severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+                 ELSE 3 END, f.score DESC NULLS LAST, f.id
+    """
+    with connect() as c:
+        return c.execute(q, (ids, ids)).fetchall()
+
+
+def person_profile(epic_no: str) -> dict:
+    """Everything the DB holds about one EPIC: all voter rows (each year),
+    all stored images, and every fraud flag on any of those rows."""
+    rows = voters_by_epic(epic_no)
+    ids = [r["id"] for r in rows]
+    return {
+        "epic_no": epic_no,
+        "rows": rows,
+        "voter_ids": ids,
+        "documents": epic_documents(epic_no),
+        "flags": flags_for_voters(ids),
+    }
+
+
 def filter_options(year: int | None = None) -> dict:
     """Distinct values present in the data, for populating the filter widgets.
     Scoped to `year` when given so the choices match what's actually there."""

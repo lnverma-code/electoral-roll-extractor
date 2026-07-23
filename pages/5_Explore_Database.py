@@ -12,7 +12,7 @@ import explore
 from auth import require_auth
 from dbx import available_years, db_ready, init_schema
 from explore import Filters
-from fraud_rules import get_photo, get_photos
+from fraud_rules import get_photos
 
 load_dotenv()
 
@@ -118,10 +118,12 @@ def _go(delta_or_target, *, absolute=False) -> None:
     cur = st.session_state["exp_page"]
     nxt = delta_or_target if absolute else cur + delta_or_target
     st.session_state["exp_page"] = max(1, min(int(nxt), pages))
+    st.session_state.pop("exp_table", None)  # a paged-away row selection is stale
 
 def _jump_cb() -> None:
     st.session_state["exp_page"] = max(1, min(int(st.session_state["exp_jump"]),
                                               pages))
+    st.session_state.pop("exp_table", None)
 
 def _pager(suffix: str, *, with_jump: bool) -> None:
     p = st.session_state["exp_page"]
@@ -150,16 +152,151 @@ def _pager(suffix: str, *, with_jump: bool) -> None:
 page = st.session_state["exp_page"]
 start = (page - 1) * PAGE_SIZE + 1
 end = min(page * PAGE_SIZE, total)
-st.caption(f"Showing **{start:,}–{end:,}** of **{total:,}** · page "
-           f"**{page}** of **{pages}** · {PAGE_SIZE} per page")
-_pager("top", with_jump=True)
-
 rows = explore.page_rows(flt, sort=sort, page=page)
+
+
+# ---- selection helpers + the full per-person profile ---------------------
+def _pick_epic(epic: str) -> None:
+    st.session_state["exp_epic"] = epic
+
+def _clear_profile() -> None:
+    st.session_state.pop("exp_epic", None)
+    st.session_state.pop("exp_table", None)
+
+
+def render_profile(epic: str) -> None:
+    """Everything the database holds about one EPIC — every year-instance, every
+    stored image, and every fraud flag that references this person."""
+    prof = explore.person_profile(epic)
+    prows = prof["rows"]
+    if not prows:
+        st.warning(f"No voter row found for EPIC {epic}.")
+        return
+    head = prows[0]
+    status = head["epic_lookup_status"] or "Pending"
+    badge = {"Found": "✅ enriched", "Not found": "❌ not found on ECINET"}.get(
+        status, "🕓 not enriched yet")
+
+    h1, h2 = st.columns([5, 1])
+    h1.markdown(f"### 👤 {head['name']}\n`{epic}` · {badge} · "
+                f"appears in **{len(prows)}** revision year(s)")
+    h2.button("✖ Close", on_click=_clear_profile, use_container_width=True,
+              key="close_profile")
+
+    # ---- all images: one roll photo per year-instance + ECINET documents ---
+    imgs = get_photos(prof["voter_ids"])
+    tiles = [("roll", r) for r in prows] + [("doc", d) for d in prof["documents"]]
+    st.markdown("**Photos & documents**")
+    if tiles:
+        cols = st.columns(min(len(tiles), 5))
+        for i, (kind, obj) in enumerate(tiles):
+            with cols[i % len(cols)]:
+                if kind == "roll":
+                    im = imgs.get(obj["id"])
+                    cap = f"Roll photo · {obj['year']}"
+                else:
+                    im = obj["image"]
+                    cap = f"{obj['doc_type']} · {obj['ext']}"
+                if im:
+                    st.image(im, caption=cap, use_container_width=True)
+                else:
+                    st.caption(f"_{cap}: none_")
+    else:
+        st.caption("No images stored for this person.")
+
+    # ---- roll records, one row per revision year --------------------------
+    st.markdown("**Roll records**")
+    roll_cols = ["year", "constituency_no", "constituency_name", "part_no",
+                 "serial_no", "epic_no", "name", "relation_type",
+                 "relation_name", "house_number", "age", "gender"]
+    st.dataframe(pd.DataFrame([{k: r[k] for k in roll_cols} for r in prows]),
+                 hide_index=True, use_container_width=True)
+
+    # ---- ECINET enrichment (identical across years; show once) ------------
+    enriched = next((r for r in prows if r["epic_lookup_status"] == "Found"),
+                    None)
+    if enriched:
+        enr_cols = ["verified_name", "verified_dob", "verified_age", "mobile_no",
+                    "father_or_guardian_name", "mother_name", "spouse_name",
+                    "verified_house_no", "verified_part_no", "part_serial_no",
+                    "part_name", "ac_name", "category_type", "relation_type_code",
+                    "relation_epic", "relation_name_verified", "district_cd",
+                    "state_cd", "survey_channel", "submitted_for_recommendation",
+                    "enum_created_on", "enum_modified_on", "lookup_officer",
+                    "lookup_ac_no", "epic_id", "aadhaar_ref_no", "epic_lookup_at"]
+        enr = {k: enriched[k] for k in enr_cols if enriched[k] not in (None, "")}
+        st.markdown("**ECINET enrichment**")
+        st.dataframe(pd.DataFrame(enr.items(), columns=["Field", "Value"]),
+                     hide_index=True, use_container_width=True)
+    else:
+        st.info("Not enriched yet — run **EPIC Enrichment** to fetch the "
+                "verified details and document images for this EPIC.")
+
+    # ---- fraud flags on either side of a pair -----------------------------
+    flags = prof["flags"]
+    st.markdown(f"**Fraud flags — {len(flags)}**")
+    if not flags:
+        st.success("No fraud flags reference this person.")
+        return
+    sev_ct = {s: sum(1 for f in flags if f["severity"] == s)
+              for s in ("high", "medium", "low")}
+    reviewed = sum(1 for f in flags if f["verdict"])
+    st.caption(f"🔴 {sev_ct['high']} high · 🟠 {sev_ct['medium']} medium · "
+               f"🟡 {sev_ct['low']} low · {reviewed} reviewed. A flag is a lead, "
+               "not a verdict.")
+
+    def _other(f):
+        a_is_this = f["epic_a"] == epic
+        n = f["name_b"] if a_is_this else f["name_a"]
+        e = f["epic_b"] if a_is_this else f["epic_a"]
+        yr = f["year_b"] if a_is_this else f["year_a"]
+        ac = f["const_b"] if a_is_this else f["const_a"]
+        return n, e, yr, ac
+
+    fdf = []
+    for f in flags:
+        n, e, yr, ac = _other(f)
+        fdf.append({
+            "severity": f["severity"], "rule": f["rule"],
+            "score": round(f["score"], 3) if isinstance(f["score"], float)
+            else f["score"],
+            "matches": n or "—", "their EPIC": e or "—",
+            "their year": yr, "their AC": ac,
+            "review": f["verdict"] or "unreviewed",
+        })
+    st.dataframe(pd.DataFrame(fdf), hide_index=True, use_container_width=True,
+                 height=min(360, 80 + 35 * len(fdf)))
+    others = sorted({e for f in flags if (e := _other(f)[1])})
+    if others:
+        st.caption("Open any linked person by pasting their EPIC into the "
+                   "search box, then click their row.")
+
+
+# ---- profile panel (top of the results area, when one is selected) --------
+if st.session_state.get("exp_epic"):
+    with st.container(border=True):
+        render_profile(st.session_state["exp_epic"])
+    st.divider()
+
+st.caption(f"Showing **{start:,}–{end:,}** of **{total:,}** · page "
+           f"**{page}** of **{pages}** · {PAGE_SIZE} per page · "
+           "click a row (Table) or **View** (Gallery) to open a full profile")
+_pager("top", with_jump=True)
 
 # ---------------------------------------------------------------- results
 if view == "Table":
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True, height=560)
+    event = st.dataframe(df, use_container_width=True, hide_index=True,
+                         height=560, key="exp_table", on_select="rerun",
+                         selection_mode="single-row")
+    picked = None
+    if event and event.selection and event.selection.rows:
+        idx = event.selection.rows[0]
+        if idx < len(rows):
+            picked = rows[idx]["epic_no"]
+    if picked and picked != st.session_state.get("exp_epic"):
+        st.session_state["exp_epic"] = picked
+        st.rerun()
 else:
     photos = get_photos([r["id"] for r in rows])
     per_row = 5
@@ -179,56 +316,11 @@ else:
                            f"P{r['part_no']}/#{r['serial_no']}\n\n"
                            f"{r['gender']}, age {r['age']} · {r['relation_type']} "
                            f"{r['relation_name']}")
+                st.button("🔍 View", key=f"view_{r['id']}",
+                          on_click=_pick_epic, args=(r["epic_no"],),
+                          use_container_width=True)
 
 _pager("bottom", with_jump=False)
-
-# ---------------------------------------------------------------- detail view
-st.divider()
-st.subheader("Voter detail")
-label = {f"{r['name']} — {r['epic_no']} (AC {r['constituency_no']} "
-         f"#{r['serial_no']})": r["id"] for r in rows}
-pick = st.selectbox("Open a full record from this page", ["—"] + list(label))
-if pick != "—":
-    v = explore.voter_full(label[pick])
-    dc = st.columns([1, 2])
-    with dc[0]:
-        img = get_photo(v["id"])
-        if img:
-            st.image(img, caption="Roll photo", use_container_width=True)
-        else:
-            st.caption("_no roll photo_")
-    with dc[1]:
-        roll = {k: v[k] for k in (
-            "year", "constituency_no", "constituency_name", "part_no",
-            "serial_no", "epic_no", "name", "relation_type", "relation_name",
-            "house_number", "age", "gender")}
-        st.markdown("**Roll record**")
-        st.dataframe(pd.DataFrame(roll.items(), columns=["Field", "Value"]),
-                     hide_index=True, use_container_width=True)
-
-    if v["epic_lookup_status"] == "Found":
-        enr = {k: v[k] for k in (
-            "verified_name", "verified_dob", "verified_age", "mobile_no",
-            "father_or_guardian_name", "mother_name", "spouse_name",
-            "verified_house_no", "verified_part_no", "part_serial_no",
-            "part_name", "ac_name", "category_type", "relation_epic",
-            "relation_name_verified", "lookup_officer", "epic_lookup_at")
-            if v[k] not in (None, "")}
-        st.markdown("**ECINET enrichment**")
-        st.dataframe(pd.DataFrame(enr.items(), columns=["Field", "Value"]),
-                     hide_index=True, use_container_width=True)
-
-        docs = explore.epic_documents(v["epic_no"])
-        if docs:
-            dcols = st.columns(len(docs))
-            for col, d in zip(dcols, docs):
-                if d["image"]:
-                    col.image(d["image"],
-                              caption=f"{d['doc_type']} ({d['bytes']:,} bytes)",
-                              use_container_width=True)
-    else:
-        st.caption(f"Enrichment status: **{v['epic_lookup_status'] or 'Pending'}"
-                   "** — no ECINET record fetched yet.")
 
 # ---------------------------------------------------------------- export
 st.divider()
